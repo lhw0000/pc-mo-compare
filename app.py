@@ -27,12 +27,19 @@ MOMO_HEADERS = {
 }
 
 # --- PChome 24h ---
-PCHOME_API = "https://ecshweb.pchome.com.tw/search/v3.3/all/results"
+# v4.3 是目前 PChome 搜尋頁使用的 API；v3.3 為舊版，當備援
+PCHOME_APIS = [
+    "https://ecshweb.pchome.com.tw/search/v4.3/all/results",
+    "https://ecshweb.pchome.com.tw/search/v3.3/all/results",
+]
 PCHOME_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Origin": "https://24h.pchome.com.tw",
     "Referer": "https://24h.pchome.com.tw/",
 }
+
+LOG: list = []  # 爬取紀錄，方便除錯
 
 
 # ------------------------------------------------------------------
@@ -77,12 +84,12 @@ def scrape_momo(keyword, pages, delay, on_page):
             MOMO_API, headers=MOMO_HEADERS, json=build_momo_payload(keyword, page)
         )
         if resp.status_code != 200:
-            st.warning(f"MOMO 第 {page} 頁請求失敗（HTTP {resp.status_code}），已停止。")
+            LOG.append(f"MOMO 第 {page} 頁請求失敗（HTTP {resp.status_code}）：{resp.text[:200]}")
             break
 
         products = resp.json().get("rtnSearchData", {}).get("goodsInfoList", [])
         if not products:
-            st.info(f"MOMO 第 {page} 頁沒有資料，已提前結束。")
+            LOG.append(f"MOMO 第 {page} 頁沒有資料，已提前結束。")
             break
 
         for p in products:
@@ -94,35 +101,70 @@ def scrape_momo(keyword, pages, delay, on_page):
     return rows
 
 
+def _pick(d, *keys):
+    """PChome 不同版本的欄位大小寫不一（Prods / prods），依序嘗試。"""
+    if isinstance(d, dict):
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+    return None
+
+
+def _pchome_price(p):
+    price = _pick(p, "Price", "price")
+    if isinstance(price, dict):  # 舊版格式：{"M": 原價, "P": 售價}
+        price = price.get("P") or price.get("M")
+    return price
+
+
 def scrape_pchome(keyword, pages, delay, on_page):
     session = requests.Session(impersonate="chrome")
+    session.get("https://24h.pchome.com.tw/", headers=PCHOME_HEADERS)  # 先取得 cookie
 
     rows = []
+    api = None  # 第一頁成功的 API 會被沿用
     for page in range(1, pages + 1):
         on_page("PChome", page)
-        resp = session.get(
-            PCHOME_API,
-            headers=PCHOME_HEADERS,
-            params={"q": keyword, "page": page, "sort": "sale/dc"},
-        )
-        if resp.status_code != 200:
-            st.warning(f"PChome 第 {page} 頁請求失敗（HTTP {resp.status_code}），已停止。")
+        params = {"q": keyword, "page": page, "sort": "sale/dc"}
+
+        data = None
+        for url in ([api] if api else PCHOME_APIS):
+            try:
+                resp = session.get(url, headers=PCHOME_HEADERS, params=params, timeout=30)
+            except Exception as e:
+                LOG.append(f"PChome 第 {page} 頁 {url} 連線錯誤：{e}")
+                continue
+            if resp.status_code == 400 and page > 1:
+                LOG.append(f"PChome 第 {page} 頁超出範圍（HTTP 400），已全部爬完。")
+                return rows
+            if resp.status_code != 200:
+                LOG.append(f"PChome 第 {page} 頁 {url} 失敗（HTTP {resp.status_code}）：{resp.text[:200]}")
+                continue
+            try:
+                js = resp.json()
+            except Exception:
+                LOG.append(f"PChome 第 {page} 頁 {url} 回傳的不是 JSON：{resp.text[:200]}")
+                continue
+            if _pick(js, "Prods", "prods", "Products"):
+                data, api = js, url
+                break
+            LOG.append(f"PChome 第 {page} 頁 {url} 沒有商品，回傳欄位：{list(js)[:10]}")
+
+        if data is None:
             break
 
-        data = resp.json()
-        products = data.get("prods") or []
-        if not products:
-            st.info(f"PChome 第 {page} 頁沒有資料，已提前結束。")
-            break
-
-        for p in products:
+        for p in _pick(data, "Prods", "prods", "Products"):
             rows.append(
-                {"平台": "PChome", "品名": p.get("name", ""), "價格": p.get("price", "")}
+                {
+                    "平台": "PChome",
+                    "品名": _pick(p, "Name", "name") or "",
+                    "價格": _pchome_price(p) or "",
+                }
             )
 
-        total_page = data.get("totalPage") or page
-        if page >= total_page:
-            st.info(f"PChome 搜尋結果只有 {total_page} 頁，已全部爬完。")
+        total_page = _pick(data, "TotalPage", "totalPage") or page
+        if page >= int(total_page):
+            LOG.append(f"PChome 搜尋結果只有 {total_page} 頁，已全部爬完。")
             break
         if page < pages:
             time.sleep(delay)
@@ -141,11 +183,15 @@ def scrape_all(keyword, platforms, pages, delay, progress, status) -> pd.DataFra
         done["n"] += 1
         progress.progress(min(done["n"] / total, 1.0))
 
+    LOG.clear()
     rows = []
     for pf in platforms:
         try:
-            rows.extend(SCRAPERS[pf](keyword, pages, delay, on_page))
+            got = SCRAPERS[pf](keyword, pages, delay, on_page)
+            LOG.append(f"{pf}：共取得 {len(got)} 筆商品。")
+            rows.extend(got)
         except Exception as e:  # 一個平台失敗不影響另一個
+            LOG.append(f"{pf} 爬取時發生錯誤：{e}")
             st.error(f"{pf} 爬取時發生錯誤：{e}")
     return pd.DataFrame(rows)
 
@@ -218,6 +264,7 @@ if run:
         raw = scrape_all(keyword.strip(), platforms, int(pages), delay, progress, status)
         status.empty()
         progress.empty()
+        st.session_state["log"] = list(LOG)
 
         if raw.empty:
             st.session_state.pop("result", None)
@@ -228,6 +275,11 @@ if run:
 # ------------------------------------------------------------------
 # 顯示結果
 # ------------------------------------------------------------------
+if st.session_state.get("log"):
+    with st.expander("爬取紀錄（某個平台沒資料時請看這裡）"):
+        for line in st.session_state["log"]:
+            st.write(line)
+
 result = st.session_state.get("result")
 if result:
     df = result["df"]
